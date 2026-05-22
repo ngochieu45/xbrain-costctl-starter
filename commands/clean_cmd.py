@@ -39,21 +39,87 @@ VERIFY
 ------
     pytest tests/test_clean.py -v
 """
+
 import boto3
 
-from commands._common import parse_kv
+from commands._common import parse_kv, tags_to_dict
 
 
 def _find_targets(tag_key, tag_val):
-    """Return {"ec2": [...], "volume": [...]} matching tag in non-terminal state."""
-    raise NotImplementedError("TODO: implement _find_targets — see test_clean.py")
+    ec2 = boto3.client("ec2")
+
+    targets = {
+        "ec2": [],
+        "volume": [],
+    }
+
+    paginator = ec2.get_paginator("describe_instances")
+
+    for page in paginator.paginate():
+        for reservation in page["Reservations"]:
+            for instance in reservation["Instances"]:
+
+                state = instance["State"]["Name"]
+
+                if state in ["terminated", "shutting-down"]:
+                    continue
+
+                tags = tags_to_dict(instance.get("Tags", []))
+
+                if tags.get(tag_key) == tag_val:
+                    targets["ec2"].append(instance["InstanceId"])
+
+    vpaginator = ec2.get_paginator("describe_volumes")
+
+    for page in vpaginator.paginate():
+        for volume in page["Volumes"]:
+
+            if volume["State"] != "available":
+                continue
+
+            tags = tags_to_dict(volume.get("Tags", []))
+
+            if tags.get(tag_key) == tag_val:
+                targets["volume"].append(volume["VolumeId"])
+
+    return targets
 
 
 def run(args):
-    """Entry point.
+    tag_key, tag_val = parse_kv(args.tag)
 
-    Args set by argparse:
-        args.tag    — "key=value" string (REQUIRED)
-        args.apply  — bool, must be True to actually delete (default False = dry-run)
-    """
-    raise NotImplementedError("TODO: implement run() — see module docstring")
+    targets = _find_targets(tag_key, tag_val)
+
+    ec2_targets = targets["ec2"]
+    volume_targets = targets["volume"]
+
+    if not ec2_targets and not volume_targets:
+        print("Nothing to clean.")
+        return
+
+    print(f"EC2 targets: {ec2_targets}")
+    print(f"Volume targets: {volume_targets}")
+
+    if not args.apply:
+        print("(dry-run — pass --apply to actually delete)")
+        return
+
+    ec2 = boto3.client("ec2")
+
+    if ec2_targets:
+        ec2.terminate_instances(
+            InstanceIds=ec2_targets
+        )
+        print(f"Terminated {len(ec2_targets)} EC2 instance(s)")
+
+    for vid in volume_targets:
+        ec2.delete_volume(
+            VolumeId=vid
+        )
+        print(f"Deleted volume {vid}")
+
+    print("Cleanup applied.")
+
+
+
+
